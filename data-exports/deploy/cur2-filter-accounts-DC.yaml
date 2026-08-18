@@ -26,12 +26,11 @@ Parameters:
   AthenaResultsBucket:
     Type: String
     Default: ''
-    Description: 'S3 Bucket for Athena query results (enter bucket name used for data collection.)'
+    Description: 'S3 Bucket for Athena query results (enter bucket name used for data collection. Leave blank for default bucket)'
 
   FilterAccountIds:
     Type: String
-    Default: ''
-    AllowedPattern: '^(\d{12}(,\d{12})*)?$'
+    AllowedPattern: '^\d{12}(,\d{12})*$'
     ConstraintDescription: 'Must be a comma-separated list of 12-digit AWS account IDs (e.g., 111222333444,555666777888)'
     Description: 'Comma-separated list of account IDs to filter'
   
@@ -39,6 +38,12 @@ Parameters:
     Type: String
     Default: 'cron(0 6 * * ? *)'
     Description: 'Schedule expression for daily execution'
+
+  AlarmEmail:
+    Type: String
+    AllowedPattern: '^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+    Description: 'Email address for CloudWatch alarm notifications'
 
   
 
@@ -51,7 +56,7 @@ Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: cid-data-filter-lambda-role
+      RoleName: !Sub '${AWS::StackName}-cid-data-filter-lambda-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -60,7 +65,7 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
       Policies:
         - PolicyName: AthenaS3AccessPolicy
           PolicyDocument:
@@ -76,18 +81,18 @@ Resources:
                   - s3:DeleteObject
 
                 Resource:
-                  - !Sub 'arn:aws:s3:::${TargetS3Bucket}'
-                  - !Sub 'arn:aws:s3:::${TargetS3Bucket}/*'
-                  - !Sub 'arn:aws:s3:::cid-${AWS::AccountId}-data-exports'
-                  - !Sub 'arn:aws:s3:::cid-${AWS::AccountId}-data-exports/*' 
+                  - !Sub 'arn:${AWS::Partition}:s3:::${TargetS3Bucket}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${TargetS3Bucket}/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::cid-${AWS::AccountId}-data-exports'
+                  - !Sub 'arn:${AWS::Partition}:s3:::cid-${AWS::AccountId}-data-exports/*' 
                   - !If
                     - AthenaResultsBucketNotProvided
-                    - !Sub 'arn:aws:s3:::${AWS::Partition}-athena-query-results-cid-${AWS::AccountId}-${AWS::Region}'
-                    - !Sub 'arn:aws:s3:::${AthenaResultsBucket}'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${AWS::Partition}-athena-query-results-cid-${AWS::AccountId}-${AWS::Region}'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${AthenaResultsBucket}'
                   - !If
                     - AthenaResultsBucketNotProvided
-                    - !Sub 'arn:aws:s3:::${AWS::Partition}-athena-query-results-cid-${AWS::AccountId}-${AWS::Region}/*'
-                    - !Sub 'arn:aws:s3:::${AthenaResultsBucket}/*'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${AWS::Partition}-athena-query-results-cid-${AWS::AccountId}-${AWS::Region}/*'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${AthenaResultsBucket}/*'
               - Effect: Allow
                 Action:
                   - athena:StartQueryExecution
@@ -95,16 +100,16 @@ Resources:
                   - athena:GetQueryResults
                   - athena:StopQueryExecution
                 Resource:
-                  - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/primary'                  
+                  - !Sub 'arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/primary'                  
               - Effect: Allow
                 Action:
                   - glue:GetDatabase
                   - glue:GetTable
                   - glue:GetPartitions
                 Resource:
-                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
-                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${SourceDatabase}'
-                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${SourceDatabase}/${SourceTable}'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${SourceDatabase}'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${SourceDatabase}/${SourceTable}'
 
   # Lambda function for Athena query execution
   AthenaQueryLambda:
@@ -149,7 +154,27 @@ Resources:
               if objects_to_delete:
                   for i in range(0, len(objects_to_delete), 1000):
                       s3.delete_objects(Bucket=bucket, Delete={'Objects': objects_to_delete[i:i+1000]})
-                  print(f"Deleted {len(objects_to_delete)} files from {prefix}")
+                  print(f"Deleted {len(objects_to_delete)} files from s3://{bucket}/{prefix}")
+          
+          def move_files(bucket, source_prefix, target_prefix):
+              """Move all files from source prefix to target prefix"""
+              paginator = s3.get_paginator('list_objects_v2')
+              pages = paginator.paginate(Bucket=bucket, Prefix=source_prefix)
+              moved_count = 0
+              for page in pages:
+                  if 'Contents' in page:
+                      for obj in page['Contents']:
+                          source_key = obj['Key']
+                          # Replace source prefix with target prefix
+                          target_key = target_prefix + source_key[len(source_prefix):]
+                          s3.copy_object(
+                              Bucket=bucket,
+                              CopySource={'Bucket': bucket, 'Key': source_key},
+                              Key=target_key
+                          )
+                          s3.delete_object(Bucket=bucket, Key=source_key)
+                          moved_count += 1
+              print(f"Moved {moved_count} files from s3://{bucket}/{source_prefix} to s3://{bucket}/{target_prefix}")
           
           def lambda_handler(event, context):
               try:
@@ -158,17 +183,23 @@ Resources:
                   source_table = os.environ['SOURCE_TABLE']
                   target_bucket = os.environ['TARGET_S3_BUCKET']
                   payer_account = os.environ['PAYER_ACCOUNT_ID']
-                  filter_accounts = os.environ['FILTER_ACCOUNT_IDS'].split(',')
+                  filter_accounts_raw = os.environ.get('FILTER_ACCOUNT_IDS', '').strip()
+                  if not filter_accounts_raw:
+                      raise ValueError("FILTER_ACCOUNT_IDS is blank. At least one account ID is required.")
+                  filter_accounts = filter_accounts_raw.split(',')
                   results_bucket = os.environ['ATHENA_RESULTS_BUCKET']
                   
                   # Build account filter
                   account_filter = "', '".join([acc.strip() for acc in filter_accounts])
                   
-                  # Delete all existing files under data directory
-                  prefix = f'{payer_account}/cid-cur2/cid-cur2/'
-                  delete_all_files(target_bucket, prefix)
+                  # Define paths
+                  staging_prefix = f'temp/cid-cur2/staging/'
+                  final_prefix = f'{payer_account}/cid-cur2/cid-cur2/'
                   
-                  # Construct the UNLOAD query
+                  # Clean up any leftover staging data from previous runs
+                  delete_all_files(target_bucket, staging_prefix)
+                  
+                  # Construct the UNLOAD query - write to staging location
                   query = f"""
                   UNLOAD (
                       SELECT *
@@ -176,7 +207,7 @@ Resources:
                       FROM {source_db}.{source_table}
                       WHERE line_item_usage_account_id IN ('{account_filter}')
                   )
-                  TO 's3://{target_bucket}/{payer_account}/cid-cur2/cid-cur2/'
+                  TO 's3://{target_bucket}/{staging_prefix}'
 
                   WITH (
                       format = 'PARQUET',                      
@@ -205,9 +236,16 @@ Resources:
                       response = athena.get_query_execution(QueryExecutionId=query_execution_id)
                       status = response['QueryExecution']['Status']['State']
                       
-                      if status in ['SUCCEEDED']:
-                          success_message = f"Athena query completed successfully. Query ID: {query_execution_id}"
-                          print(success_message)
+                      if status == 'SUCCEEDED':
+                          print(f"Athena query completed successfully. Query ID: {query_execution_id}")
+                          
+                          # Delete old data only after query succeeds
+                          print("Deleting old data from final location...")
+                          delete_all_files(target_bucket, final_prefix)
+                          
+                          # Move staging data to final location
+                          print("Moving staging data to final location...")
+                          move_files(target_bucket, staging_prefix, final_prefix)
                           
                           return {
                               'statusCode': 200,
@@ -222,13 +260,15 @@ Resources:
                           error_reason = response['QueryExecution']['Status'].get('StateChangeReason', 'Unknown error')
                           error_message = f"Athena query failed. Query ID: {query_execution_id}. Reason: {error_reason}"
                           print(error_message)
-                          
+                          # Clean up staging on failure
+                          delete_all_files(target_bucket, staging_prefix)
                           raise Exception(error_message)
                       
                       time.sleep(wait_interval)
                       elapsed_time += wait_interval
                   
-                  # Timeout case
+                  # Timeout case - clean up staging
+                  delete_all_files(target_bucket, staging_prefix)
                   timeout_message = f"Query execution timed out after {max_wait_time} seconds. Query ID: {query_execution_id}"
                   print(timeout_message)
                   
@@ -237,13 +277,7 @@ Resources:
               except Exception as e:
                   error_message = f"Lambda execution failed: {str(e)}"
                   print(error_message)
-                  
-                  return {
-                      'statusCode': 500,
-                      'body': json.dumps({
-                          'error': error_message
-                      })
-                      }
+                  raise
 
   # EventBridge rule for daily scheduling
   DailyScheduleRule:
@@ -256,6 +290,11 @@ Resources:
       Targets:
         - Arn: !GetAtt AthenaQueryLambda.Arn
           Id: 'AthenaQueryTarget'
+          DeadLetterConfig:
+            Arn: !GetAtt LambdaDLQ.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 3600
 
   # Permission for EventBridge to invoke Lambda
   LambdaInvokePermission:
@@ -272,6 +311,65 @@ Resources:
     Properties:
       LogGroupName: !Sub '/aws/lambda/${AthenaQueryLambda}'
       RetentionInDays: 14
+
+  # SNS Topic for alarm notifications
+  AlarmSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-lambda-alarms'
+
+  AlarmSnsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmSnsTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # CloudWatch Alarm on Lambda Errors metric
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-lambda-errors'
+      AlarmDescription: 'Alarm when Lambda function reports errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AthenaQueryLambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmSnsTopic
+      OKActions:
+        - !Ref AlarmSnsTopic
+
+  # Dead Letter Queue for async/EventBridge invocation failures
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  LambdaDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref LambdaDLQ
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt LambdaDLQ.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt DailyScheduleRule.Arn
 
 Outputs:
   cidrole:
