@@ -156,6 +156,33 @@ Resources:
                       s3.delete_objects(Bucket=bucket, Delete={'Objects': objects_to_delete[i:i+1000]})
                   print(f"Deleted {len(objects_to_delete)} files from s3://{bucket}/{prefix}")
           
+          def delete_old_partitions(bucket, prefix, cutoff_date):
+              """Delete partition folders within the refresh window (>= cutoff_date).
+              These will be replaced by fresh query data. Older partitions are kept intact.
+              Expects partition folders named like billing_period=YYYY-MM-DD/ or billing_period=YYYY-MM/"""
+              import re
+              paginator = s3.get_paginator('list_objects_v2')
+              pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
+              objects_to_delete = []
+              partition_pattern = re.compile(r'billing_period=([^/]+)/')
+              for page in pages:
+                  if 'Contents' in page:
+                      for obj in page['Contents']:
+                          match = partition_pattern.search(obj['Key'])
+                          if match:
+                              partition_date = match.group(1)
+                              # Normalize to YYYY-MM for comparison
+                              partition_month = partition_date[:7]
+                              cutoff_month = cutoff_date[:7]
+                              if partition_month >= cutoff_month:
+                                  objects_to_delete.append({'Key': obj['Key']})
+              if objects_to_delete:
+                  for i in range(0, len(objects_to_delete), 1000):
+                      s3.delete_objects(Bucket=bucket, Delete={'Objects': objects_to_delete[i:i+1000]})
+                  print(f"Deleted {len(objects_to_delete)} files from partitions >= {cutoff_date} (refresh window) in s3://{bucket}/{prefix}")
+              else:
+                  print(f"No partitions in refresh window (>= {cutoff_date}) found in s3://{bucket}/{prefix}")
+          
           def move_files(bucket, source_prefix, target_prefix):
               """Move all files from source prefix to target prefix"""
               paginator = s3.get_paginator('list_objects_v2')
@@ -199,6 +226,29 @@ Resources:
                   # Clean up any leftover staging data from previous runs
                   delete_all_files(target_bucket, staging_prefix)
                   
+                  # Check if this is the first run by looking for existing data in target location
+                  first_run = True
+                  response_check = s3.list_objects_v2(
+                      Bucket=target_bucket,
+                      Prefix=final_prefix,
+                      MaxKeys=1
+                  )
+                  if response_check.get('KeyCount', 0) > 0:
+                      first_run = False
+                  
+                  # Build billing_period filter (skip on first run to get full history)
+                  billing_period_clause = ''
+                  if not first_run:
+                      today = datetime.today()
+                      current_month_start = today.replace(day=1)
+                      two_months_ago = (current_month_start - timedelta(days=1)).replace(day=1)
+                      two_months_ago = (two_months_ago - timedelta(days=1)).replace(day=1)
+                      billing_period_start = two_months_ago.strftime('%Y-%m')
+                      billing_period_clause = f"AND billing_period >= '{billing_period_start}'"
+                      print(f"Subsequent run detected. Filtering billing_period >= {billing_period_start}")
+                  else:
+                      print("First run detected (no existing data). Fetching full history without billing_period filter.")
+                  
                   # Construct the UNLOAD query - write to staging location
                   query = f"""
                   UNLOAD (
@@ -206,6 +256,7 @@ Resources:
                           
                       FROM {source_db}.{source_table}
                       WHERE line_item_usage_account_id IN ('{account_filter}')
+                        {billing_period_clause}
                   )
                   TO 's3://{target_bucket}/{staging_prefix}'
 
@@ -240,8 +291,9 @@ Resources:
                           print(f"Athena query completed successfully. Query ID: {query_execution_id}")
                           
                           # Delete old data only after query succeeds
-                          print("Deleting old data from final location...")
-                          delete_all_files(target_bucket, final_prefix)
+                          if not first_run:
+                              print(f"Subsequent run: deleting partitions in refresh window (>= {billing_period_start})...")
+                              delete_old_partitions(target_bucket, final_prefix, billing_period_start)
                           
                           # Move staging data to final location
                           print("Moving staging data to final location...")
